@@ -379,53 +379,31 @@ if SED_D50 is None:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _select_input_files():
-    """Prompt for a file number matching Flow_Data_##.csv and Channel_Data_##.csv."""
+def _select_bc_file():
+    """Prompt for a BC file number; auto-select when non-interactive."""
     import re
-    flow_pattern = re.compile(r'Flow_Data_(\d+)\.csv', re.IGNORECASE)
-    chan_pattern = re.compile(r'Channel_Data_(\d+)\.csv', re.IGNORECASE)
-
-    flow_nums = set(
-        int(m.group(1)) for f in os.listdir(SCRIPT_DIR) if (m := flow_pattern.match(f))
+    pattern = re.compile(r'BC_(\d+)\.csv', re.IGNORECASE)
+    available = sorted(
+        int(m.group(1))
+        for f in os.listdir(SCRIPT_DIR)
+        if (m := pattern.match(f))
     )
-    chan_nums = set(
-        int(m.group(1)) for f in os.listdir(SCRIPT_DIR) if (m := chan_pattern.match(f))
-    )
-    available = sorted(list(flow_nums.intersection(chan_nums)))
-
     if not sys.stdin.isatty():
         if available:
-            num = available[-1] # Auto-select the latest
-            print(f"(non-interactive) Auto-selecting pair number {num:02d}")
-            return os.path.join(SCRIPT_DIR, f'Flow_Data_{num:02d}.csv'), \
-                   os.path.join(SCRIPT_DIR, f'Channel_Data_{num:02d}.csv'), \
-                   f"{num:02d}"
-        print("No matching Flow_Data_##.csv and Channel_Data_##.csv pairs found in", SCRIPT_DIR)
+            num = available[0]
+            print(f"(non-interactive) Auto-selecting BC_{num}.csv")
+            return os.path.join(SCRIPT_DIR, f'BC_{num}.csv')
+        print("No BC_*.csv files found in", SCRIPT_DIR)
         sys.exit(1)
-
     if available:
-        print(f"Available input pairs: {', '.join(f'{n:02d}' for n in available)}")
-    else:
-        print("No matching Flow_Data_##.csv and Channel_Data_##.csv pairs found in", SCRIPT_DIR)
-        sys.exit(1)
-
-    bc_num_str = input('Which file pair number (e.g., 01)? ').strip()
-    try:
-        bc_num = int(bc_num_str)
-        if bc_num not in available:
-            print(f"Warning: Pair number {bc_num:02d} not found in available pairs. Proceeding anyway.")
-        bc_num_str = f"{bc_num:02d}"
-    except ValueError:
-        pass
-
-    return os.path.join(SCRIPT_DIR, f'Flow_Data_{bc_num_str}.csv'), \
-           os.path.join(SCRIPT_DIR, f'Channel_Data_{bc_num_str}.csv'), \
-           bc_num_str
+        print(f"Available BC files: {', '.join(f'BC_{n}.csv' for n in available)}")
+    print("Enter the integer number for the BC file (e.g., 1 for BC_1.csv).")
+    bc_num = input('Which BC file? ').strip()
+    return os.path.join(SCRIPT_DIR, f'BC_{bc_num}.csv')
 
 
-FLOW_CSV_PATH, CHAN_CSV_PATH, PAIR_NUM = _select_input_files()
-print(f"Loading flow file: {FLOW_CSV_PATH}")
-print(f"Loading channel file: {CHAN_CSV_PATH}")
+CSV_PATH = _select_bc_file()
+print(f"Loading BC file: {CSV_PATH}")
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  2.  HELPER FUNCTIONS                                       ║
@@ -491,10 +469,33 @@ def get_normal_depth(Q, B, n, S):
     return y
 
 
-def _load_bc_data(csv_file, bc_type, z_bed_ds, B_ds, n_manning_ds, slope_ds):
+def _load_bc_data(csv_file, bc_type):
     """
     Load upstream (and optionally downstream) boundary-condition data
     from a CSV file produced by GenBC_1DFlowModel_V2.py.
+
+    Expected CSV columns (by position):
+      col 0 – elapsed time  [s]
+      col 1 – upstream discharge Q  [m³/s]
+      col 2 – downstream stage WSE  [m absolute]  (used with STAGE_TS only)
+
+    The Q time series is the upstream inflow hydrograph — it drives the
+    entire simulation.  The stage column is only read when bc_type =
+    'STAGE_TS'; all other modes use normal depth as the downstream BC.
+
+    Fallback behaviour
+    ~~~~~~~~~~~~~~~~~~
+    If the CSV cannot be read (missing, wrong format, permission error),
+    the function falls back to a synthetic sinusoidal hydrograph:
+        Q(t) = 50 + 20 · sin(2π t / 3600)  [m³/s]
+    This allows the model to run even without a valid BC file, which is
+    useful for classroom demonstrations.
+
+    Returns
+    -------
+    t_data     : (N,) time array [s]
+    Q_data     : (N,) discharge array [m³/s]
+    stage_data : (N,) downstream stage array [m] (zeros if NORMAL_DEPTH)
     """
     bc_type = bc_type.upper()
     try:
@@ -503,83 +504,79 @@ def _load_bc_data(csv_file, bc_type, z_bed_ds, B_ds, n_manning_ds, slope_ds):
         Q_data = df.iloc[:, 1].values.astype(float)
         if bc_type == 'STAGE_TS' and df.shape[1] >= 3:
             stage_data = df.iloc[:, 2].values.astype(float)
+            # If stage column contains -999 placeholders, fall back to normal depth
             if np.all(stage_data < -900):
                 print("Warning: stage column contains placeholders (-999).")
                 print("  → computing normal-depth stage from Q and channel geometry.")
-                stage_data = _compute_fallback_stage(Q_data, z_bed_ds, B_ds, n_manning_ds, slope_ds)
+                stage_data = _compute_fallback_stage(Q_data)
             else:
-                pass
+                print("Hydrograph and Stage data loaded successfully.")
         else:
             stage_data = np.zeros_like(t_data)
             if bc_type == 'STAGE_TS':
                 print("Warning: STAGE_TS selected but column 3 missing; computing from Manning's.")
-                stage_data = _compute_fallback_stage(Q_data, z_bed_ds, B_ds, n_manning_ds, slope_ds)
+                stage_data = _compute_fallback_stage(Q_data)
     except Exception as e:
         print(f"Error loading '{csv_file}': {e}.  Using synthetic fallback.")
         t_data     = np.linspace(0, 10000, 100)
         Q_data     = 50.0 + 20.0 * np.sin(2.0 * np.pi * t_data / 3600.0)
-        stage_data = _compute_fallback_stage(Q_data, z_bed_ds, B_ds, n_manning_ds, slope_ds)
+        stage_data = _compute_fallback_stage(Q_data)
     return t_data, Q_data, stage_data
 
 
-def _compute_fallback_stage(Q_array, z_bed_ds, B_ds, n_manning_ds, slope_ds):
+def _compute_fallback_stage(Q_array):
     """
     Compute downstream stage from Q using Manning's equation.
+
+    Used when the BC file does not contain a stage column, or when
+    the stage column contains placeholder values (−999).
+
+    The downstream bed elevation is fixed at:
+        z_bed_ds = −10.0 − S₀ · L
+
+    (The upstream datum is −10 m absolute, so the bed drops linearly
+    from −10 m at x = 0 to −10 − S₀·L at x = L.)
+
+    Stage  =  z_bed_ds  +  y_n(Q)
+
+    where y_n is the Manning normal depth for each Q in Q_array.
     """
-    depths   = np.array([get_normal_depth(max(q, 0.001), B_ds, n_manning_ds, slope_ds)
+    z_bed_ds = -10.0 - BED_SLOPE * LENGTH
+    depths   = np.array([get_normal_depth(max(q, 0.001), WIDTH, MANNING_N, BED_SLOPE)
                          for q in Q_array])
     return z_bed_ds + depths
 
 
-def _load_channel_data(csv_file):
+def _setup_grid(L, dx, S0):
     """
-    Load channel geometry from a CSV file produced by GenBC_1DFlowModel_V2.py.
+    Create the 1-D computational grid.
 
-    Expected CSV columns:
-      Distance (m) | Bed Elevation (m) | Width (m) | Manning's n
+    Grid layout
+    ~~~~~~~~~~~
+    Nodes are uniformly spaced at interval Δx from x = 0 (upstream)
+    to x = L (downstream):
+        nx = int(L / dx) + 1      (includes both end nodes)
+        x  = [0, Δx, 2Δx, … L]
 
-    Returns:
-      nx        : number of computational nodes
-      x         : (nx,) distance array
-      z_bed     : (nx,) bed elevation array
-      B         : (nx,) width array
-      n_manning : (nx,) Manning's n array
-      dx        : (float) grid spacing
-      S0        : (nx,) local bed slope array
+    Bed elevation
+    ~~~~~~~~~~~~~
+    The bed drops linearly at slope S₀:
+        z_bed(x) = −10.0 − S₀ · x
+
+    The upstream datum is −10 m (absolute).  This arbitrary choice
+    keeps all elevations clearly negative (and therefore distinguishable
+    from zero depths or zero velocities in debugging outputs).
+
+    Returns
+    -------
+    nx    : int   – number of computational nodes
+    x     : (nx,) – streamwise coordinate array [m]
+    z_bed : (nx,) – bed elevation array [m absolute]
     """
-    try:
-        df = pd.read_csv(csv_file)
-        x = df.iloc[:, 0].values.astype(float)
-        z_bed = df.iloc[:, 1].values.astype(float)
-        B = df.iloc[:, 2].values.astype(float)
-        n_manning = df.iloc[:, 3].values.astype(float)
-
-        nx = len(x)
-        if nx > 1:
-            dx = x[1] - x[0]
-            # Compute local bed slope S0 = -dz/dx
-            S0 = np.zeros(nx)
-            S0[:-1] = (z_bed[:-1] - z_bed[1:]) / dx
-            S0[-1] = S0[-2] # assume same slope at last node
-            S0 = np.maximum(S0, 1e-5) # guard against zero or negative slopes
-        else:
-            dx = 10.0
-            S0 = np.full(nx, 0.01)
-
-        print("Channel geometry loaded successfully.")
-        return nx, x, z_bed, B, n_manning, dx, S0
-
-    except Exception as e:
-        print(f"Error loading '{csv_file}': {e}. Using fallback geometry.")
-        # Fallback to the scalar configuration geometry
-        nx = int(LENGTH / DX) + 1
-        x = np.linspace(0, LENGTH, nx)
-        z_bed = -10.0 - BED_SLOPE * x
-        B = np.full(nx, WIDTH)
-        n_manning = np.full(nx, MANNING_N)
-        dx = DX
-        S0 = np.full(nx, BED_SLOPE)
-        return nx, x, z_bed, B, n_manning, dx, S0
+    nx    = int(L / dx) + 1
+    x     = np.linspace(0, L, nx)
+    z_bed = -10.0 - S0 * x          # bed drops linearly at slope S₀
+    return nx, x, z_bed
 
 
 def _downstream_depth(bc_type, Q_last, B, n_manning, slope_bc,
@@ -623,24 +620,61 @@ def _backwater_profile(nx, B, S0, n_manning, Q0, y_downstream, dx, g=9.81):
     """
     Compute an initial steady-state backwater (gradually-varied flow)
     profile using the Standard-Step method.
+
+    Purpose
+    ~~~~~~~
+    Before the unsteady simulation begins the channel must be initialised
+    to a physically consistent (non-zero, smooth) flow profile.  Starting
+    from uniform flow everywhere would be fine for mild slopes, but for
+    channels with a downstream control that imposes a depth different from
+    normal depth, the backwater profile is a better initial condition
+    because it avoids the initial transient caused by the mismatch between
+    the prescribed downstream BC and a uniform-flow IC.
+
+    GVF (Gradually Varied Flow) equation
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    The Saint-Venant momentum equation in steady state (∂Q/∂t = 0,
+    ∂(Q²/A)/∂x ≈ 0 for slowly varying geometry) reduces to:
+
+        dy/dx = (S₀ − Sƒ) / (1 − Fr²)
+
+    This is integrated numerically by marching UPSTREAM from the known
+    downstream depth y_ds, using a simple Euler step:
+        y[i] = y[i+1] − dy/dx · Δx
+
+    The denominator (1 − Fr²) becomes singular at critical flow (Fr = 1);
+    a guard value of 1e-8 is applied to prevent division by zero.
+
+    Parameters
+    ----------
+    nx            : int   – number of computational nodes
+    B             : float – channel width [m]
+    S0            : float – bed slope [m/m]
+    n_manning     : float – Manning's n [s/m^(1/3)]
+    Q0            : float – steady discharge [m³/s] (uniform along reach)
+    y_downstream  : float – known depth at the downstream node [m]
+    dx            : float – spatial step [m]
+    g             : float – gravitational acceleration [m/s²]
+
+    Returns
+    -------
+    y : (nx,) depth array [m]
+    A : (nx,) area array [m²]
+    Q : (nx,) discharge array [m³/s]  (constant = Q0)
     """
     y = np.empty(nx)
     y[-1] = y_downstream
     for i in range(nx - 2, -1, -1):
         yi  = y[i + 1]
-        Bi  = B[i] if isinstance(B, np.ndarray) else B
-        S0i = S0[i] if isinstance(S0, np.ndarray) else S0
-        ni  = n_manning[i] if isinstance(n_manning, np.ndarray) else n_manning
-
-        Ai  = Bi * yi
+        Ai  = B * yi
         Vi  = Q0 / Ai
-        Ri  = Ai / (Bi + 2.0 * yi)
-        Sfi = (ni ** 2 * Vi ** 2) / (Ri ** (4.0 / 3.0))
+        Ri  = Ai / (B + 2.0 * yi)
+        Sfi = (n_manning ** 2 * Vi ** 2) / (Ri ** (4.0 / 3.0))
         Fr2 = Vi ** 2 / (g * yi)
         denom = 1.0 - Fr2
         if abs(denom) < 1e-8:
             denom = 1e-8       # guard against critical flow singularity
-        dydx = (S0i - Sfi) / denom
+        dydx = (S0 - Sfi) / denom
         y[i] = max(y[i + 1] - dydx * dx, 0.1)
     A = y * B
     Q = np.full(nx, Q0)
@@ -1420,7 +1454,7 @@ def _sediment_step(sed, y, Q, B, n_manning, grain_sizes, dx, dt, nx,
 #  3-A.  Dynamic Wave — MacCormack  (2nd-order)
 # ────────────────────────────────────────────────────────────────
 
-def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
+def solve_dynamic_wave(L, B, S0, n_manning, dx, t_end, csv_file,
                        bc_type, slope_bc, store_interval=30.0):
     """
     Full Saint-Venant solver using the MacCormack predictor-corrector scheme.
@@ -1482,14 +1516,12 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
     """
     g = 9.81
     bc_type = bc_type.upper()
+    nx, x, z_bed = _setup_grid(L, dx, S0)
     z_bed_ds = z_bed[-1]
-    B_ds = B[-1] if isinstance(B, np.ndarray) else B
-    n_ds = n_manning[-1] if isinstance(n_manning, np.ndarray) else n_manning
-    S0_ds = S0[-1] if isinstance(S0, np.ndarray) else S0
-    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type, z_bed_ds, B_ds, n_ds, S0_ds)
+    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type)
 
     Q0   = np.interp(0.0, t_data, Q_data)
-    y_ds = _downstream_depth(bc_type, Q0, B_ds, n_ds, slope_bc,
+    y_ds = _downstream_depth(bc_type, Q0, B, n_manning, slope_bc,
                              0.0, t_data, stage_data, z_bed_ds)
     y, A, Q = _backwater_profile(nx, B, S0, n_manning, Q0, y_ds, dx, g)
 
@@ -1521,13 +1553,12 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 
         A_p = np.empty_like(A);  Q_p = np.empty_like(Q)
         A_p[:-1] = A[:-1] - dt * dQ_dx
-        S0_inner = S0[:-1] if isinstance(S0, np.ndarray) else S0
         Q_p[:-1] = Q[:-1] - dt * (
-            dQ2A_dx + g * A[:-1] * dy_dx - g * A[:-1] * (S0_inner - Sf[:-1]))
+            dQ2A_dx + g * A[:-1] * dy_dx - g * A[:-1] * (S0 - Sf[:-1]))
 
-        y_down_p = _downstream_depth(bc_type, Q[-1], B_ds, n_ds, slope_bc,
+        y_down_p = _downstream_depth(bc_type, Q[-1], B, n_manning, slope_bc,
                                      t, t_data, stage_data, z_bed_ds)
-        A_p[-1] = B_ds * y_down_p
+        A_p[-1] = B * y_down_p
         Q_p[-1] = Q_p[-2]
         Q_p[0]  = np.interp(t, t_data, Q_data)
         A_p[0]  = A[0]
@@ -1544,14 +1575,13 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         dQ2A_dx_p = np.diff(Q_p ** 2 / A_p) / dx
 
         A[1:] = 0.5 * (A[1:] + A_p[1:] - dt * dQ_dx_p)
-        S0_inner_p = S0[1:] if isinstance(S0, np.ndarray) else S0
         Q[1:] = 0.5 * (Q[1:] + Q_p[1:] - dt * (
-            dQ2A_dx_p + g * A_p[1:] * dy_dx_p - g * A_p[1:] * (S0_inner_p - Sf_p[1:])))
+            dQ2A_dx_p + g * A_p[1:] * dy_dx_p - g * A_p[1:] * (S0 - Sf_p[1:])))
 
         Q[0]  = np.interp(t + dt, t_data, Q_data)
-        y_dwn = _downstream_depth(bc_type, Q[-1], B_ds, n_ds, slope_bc,
+        y_dwn = _downstream_depth(bc_type, Q[-1], B, n_manning, slope_bc,
                                   t + dt, t_data, stage_data, z_bed_ds)
-        A[-1] = B_ds * y_dwn
+        A[-1] = B * y_dwn
 
         # ── Upstream boundary depth fix (characteristic-compatible) ──
         #
@@ -1567,11 +1597,7 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         #   At node 0 we solve:  Q₀/(B·y₀) − 2√(g·y₀) = V₁ − 2·c₁
         #   via Newton-Raphson for y₀.
         if MC_UPSTREAM_FIX:
-            B0 = B[0] if isinstance(B, np.ndarray) else B
-            B1 = B[1] if isinstance(B, np.ndarray) else B
-            n0 = n_manning[0] if isinstance(n_manning, np.ndarray) else n_manning
-            S0_0 = S0[0] if isinstance(S0, np.ndarray) else S0
-            _y1 = A[1] / B1
+            _y1 = A[1] / B
             _V1 = Q[1] / A[1]
             _c1 = np.sqrt(g * _y1)
             _Rminus = _V1 - 2.0 * _c1   # outgoing Riemann invariant
@@ -1579,10 +1605,10 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
             _y0 = _y1                    # initial guess = interior depth
             _Q0 = Q[0]
             for _it in range(25):
-                _V0 = _Q0 / (B0 * _y0)
+                _V0 = _Q0 / (B * _y0)
                 _c0 = np.sqrt(g * _y0)
                 _f  = _V0 - 2.0 * _c0 - _Rminus
-                _df = -_Q0 / (B0 * _y0 ** 2) - np.sqrt(g / _y0)
+                _df = -_Q0 / (B * _y0 ** 2) - np.sqrt(g / _y0)
                 if abs(_df) < 1e-14:
                     break
                 _y0_new = _y0 - _f / _df
@@ -1592,9 +1618,9 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 
             # Safety: clamp to within ±50 % of normal depth to reject
             # rare non-physical Newton solutions (e.g. supercritical root).
-            _yn0 = get_normal_depth(abs(_Q0), B0, n0, S0_0)
+            _yn0 = get_normal_depth(abs(_Q0), B, n_manning, S0)
             _y0  = np.clip(_y0, 0.5 * _yn0, 1.5 * _yn0)
-            A[0] = B0 * _y0
+            A[0] = B * _y0
 
         # Artificial viscosity (damps dispersive oscillations)
         # nu=0.10 gives adequate damping of Gibbs wiggles without over-diffusing;
@@ -1621,11 +1647,8 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
             _n_sp = min(MC_SPONGE_CELLS, nx - 1)
             for _i in range(_n_sp):
                 _w = MC_SPONGE_STRENGTH * np.exp(-3.0 * _i / _n_sp)
-                Bi = B[_i] if isinstance(B, np.ndarray) else B
-                ni = n_manning[_i] if isinstance(n_manning, np.ndarray) else n_manning
-                S0i = S0[_i] if isinstance(S0, np.ndarray) else S0
-                _yn_i = get_normal_depth(abs(Q[_i]), Bi, ni, S0i)
-                A[_i] = (1.0 - _w) * A[_i] + _w * (Bi * _yn_i)
+                _yn_i = get_normal_depth(abs(Q[_i]), B, n_manning, S0)
+                A[_i] = (1.0 - _w) * A[_i] + _w * (B * _yn_i)
 
         # Coupled sediment transport step
         if sed is not None:
@@ -1649,7 +1672,7 @@ def solve_dynamic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 #  3-B.  Dynamic Wave — Lax-Friedrichs  (1st-order)
 # ────────────────────────────────────────────────────────────────
 
-def solve_dynamic_wave_lax(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
+def solve_dynamic_wave_lax(L, B, S0, n_manning, dx, t_end, csv_file,
                            bc_type, slope_bc, store_interval=30.0):
     """
     Full Saint-Venant solver using the Lax-Friedrichs scheme.
@@ -1703,14 +1726,12 @@ def solve_dynamic_wave_lax(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
     """
     g = 9.81
     bc_type = bc_type.upper()
+    nx, x, z_bed = _setup_grid(L, dx, S0)
     z_bed_ds = z_bed[-1]
-    B_ds = B[-1] if isinstance(B, np.ndarray) else B
-    n_ds = n_manning[-1] if isinstance(n_manning, np.ndarray) else n_manning
-    S0_ds = S0[-1] if isinstance(S0, np.ndarray) else S0
-    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type, z_bed_ds, B_ds, n_ds, S0_ds)
+    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type)
 
     Q0   = np.interp(0.0, t_data, Q_data)
-    y_ds = _downstream_depth(bc_type, Q0, B_ds, n_ds, slope_bc,
+    y_ds = _downstream_depth(bc_type, Q0, B, n_manning, slope_bc,
                              0.0, t_data, stage_data, z_bed_ds)
     _, A, Q = _backwater_profile(nx, B, S0, n_manning, Q0, y_ds, dx, g)
 
@@ -1744,21 +1765,18 @@ def solve_dynamic_wave_lax(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 
         A_new[1:-1] = A_avg - 0.5 * (dt / dx) * dF_mass
 
-        S0_avg = 0.5 * (S0[2:] + S0[:-2]) if isinstance(S0, np.ndarray) else S0
-        S_grav = g * A_avg * S0_avg
+        S_grav = g * A_avg * S0
         Q_star = Q_avg - 0.5 * (dt / dx) * dF_mom + dt * S_grav
 
-        B_avg = 0.5 * (B[2:] + B[:-2]) if isinstance(B, np.ndarray) else B
-        n_avg = 0.5 * (n_manning[2:] + n_manning[:-2]) if isinstance(n_manning, np.ndarray) else n_manning
-        R_avg = np.maximum(A_avg / (B_avg + 2.0 * A_avg / B_avg), 0.01)
-        Kf    = (g * n_avg ** 2 * np.abs(Q_avg)) / (A_avg * R_avg ** (4.0 / 3.0))
+        R_avg = np.maximum(A_avg / (B + 2.0 * A_avg / B), 0.01)
+        Kf    = (g * n_manning ** 2 * np.abs(Q_avg)) / (A_avg * R_avg ** (4.0 / 3.0))
         Q_new[1:-1] = Q_star / (1.0 + dt * Kf)
 
         Q_new[0]  = np.interp(t + dt, t_data, Q_data)
         A_new[0]  = A_new[1]      # temporary — overwritten by Riemann fix below
-        y_down    = _downstream_depth(bc_type, Q_new[-2], B_ds, n_ds, slope_bc,
+        y_down    = _downstream_depth(bc_type, Q_new[-2], B, n_manning, slope_bc,
                                       t + dt, t_data, stage_data, z_bed_ds)
-        A_new[-1] = B_ds * y_down
+        A_new[-1] = B * y_down
         Q_new[-1] = Q_new[-2]
 
         A = np.maximum(A_new, 0.1)
@@ -1770,41 +1788,34 @@ def solve_dynamic_wave_lax(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         # values when Q changes rapidly.  Replace with the C⁻ Riemann
         # invariant  R⁻ = V₁ − 2c₁  and solve for y₀ via Newton-Raphson.
         if MC_UPSTREAM_FIX:
-            B0 = B[0] if isinstance(B, np.ndarray) else B
-            B1 = B[1] if isinstance(B, np.ndarray) else B
-            n0 = n_manning[0] if isinstance(n_manning, np.ndarray) else n_manning
-            S0_0 = S0[0] if isinstance(S0, np.ndarray) else S0
-            _y1 = A[1] / B1
+            _y1 = A[1] / B
             _V1 = Q[1] / A[1]
             _c1 = np.sqrt(g * _y1)
             _Rminus = _V1 - 2.0 * _c1
             _y0 = _y1
             _Q0 = Q[0]
             for _it in range(25):
-                _V0 = _Q0 / (B0 * _y0)
+                _V0 = _Q0 / (B * _y0)
                 _c0 = np.sqrt(g * _y0)
                 _f  = _V0 - 2.0 * _c0 - _Rminus
-                _df = -_Q0 / (B0 * _y0 ** 2) - np.sqrt(g / _y0)
+                _df = -_Q0 / (B * _y0 ** 2) - np.sqrt(g / _y0)
                 if abs(_df) < 1e-14:
                     break
                 _y0_new = _y0 - _f / _df
                 if abs(_y0_new - _y0) < 1e-8:
                     break
                 _y0 = max(_y0_new, 0.01)
-            _yn0 = get_normal_depth(abs(_Q0), B0, n0, S0_0)
+            _yn0 = get_normal_depth(abs(_Q0), B, n_manning, S0)
             _y0  = np.clip(_y0, 0.5 * _yn0, 1.5 * _yn0)
-            A[0] = B0 * _y0
+            A[0] = B * _y0
 
         # ── Optional sponge layer ──
         if MC_UPSTREAM_FIX and MC_SPONGE_STRENGTH > 0:
             _n_sp = min(MC_SPONGE_CELLS, nx - 1)
             for _i in range(_n_sp):
                 _w = MC_SPONGE_STRENGTH * np.exp(-3.0 * _i / _n_sp)
-                Bi = B[_i] if isinstance(B, np.ndarray) else B
-                ni = n_manning[_i] if isinstance(n_manning, np.ndarray) else n_manning
-                S0i = S0[_i] if isinstance(S0, np.ndarray) else S0
-                _yn_i = get_normal_depth(abs(Q[_i]), Bi, ni, S0i)
-                A[_i] = (1.0 - _w) * A[_i] + _w * (Bi * _yn_i)
+                _yn_i = get_normal_depth(abs(Q[_i]), B, n_manning, S0)
+                A[_i] = (1.0 - _w) * A[_i] + _w * (B * _yn_i)
 
         # Coupled sediment transport step
         if sed is not None:
@@ -1828,7 +1839,7 @@ def solve_dynamic_wave_lax(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 #  3-C.  Dynamic Wave — HLL Riemann Solver  (Finite Volume)
 # ────────────────────────────────────────────────────────────────
 
-def solve_dynamic_wave_hll(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
+def solve_dynamic_wave_hll(L, B, S0, n_manning, dx, t_end, csv_file,
                            bc_type, slope_bc, store_interval=30.0):
     """
     Full Saint-Venant solver using the HLL approximate Riemann solver.
@@ -1890,14 +1901,12 @@ def solve_dynamic_wave_hll(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
     """
     g = 9.81
     bc_type = bc_type.upper()
+    nx, x, z_bed = _setup_grid(L, dx, S0)
     z_bed_ds = z_bed[-1]
-    B_ds = B[-1] if isinstance(B, np.ndarray) else B
-    n_ds = n_manning[-1] if isinstance(n_manning, np.ndarray) else n_manning
-    S0_ds = S0[-1] if isinstance(S0, np.ndarray) else S0
-    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type, z_bed_ds, B_ds, n_ds, S0_ds)
+    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type)
 
     Q0   = np.interp(0.0, t_data, Q_data)
-    y_ds = _downstream_depth(bc_type, Q0, B_ds, n_ds, slope_bc,
+    y_ds = _downstream_depth(bc_type, Q0, B, n_manning, slope_bc,
                              0.0, t_data, stage_data, z_bed_ds)
     _, A, Q = _backwater_profile(nx, B, S0, n_manning, Q0, y_ds, dx, g)
 
@@ -1923,20 +1932,16 @@ def solve_dynamic_wave_hll(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         A_L, A_R = A[:-1], A[1:]
         Q_L, Q_R = Q[:-1], Q[1:]
         V_L, V_R = Q_L / A_L, Q_R / A_R
-
-        B_L = B[:-1] if isinstance(B, np.ndarray) else B
-        B_R = B[1:] if isinstance(B, np.ndarray) else B
-
-        c_L = np.sqrt(g * A_L / B_L)
-        c_R = np.sqrt(g * A_R / B_R)
+        c_L = np.sqrt(g * A_L / B)
+        c_R = np.sqrt(g * A_R / B)
 
         S_L = np.minimum(V_L - c_L, V_R - c_R)
         S_R = np.maximum(V_L + c_L, V_R + c_R)
 
         F_mass_L = Q_L
-        F_mom_L  = Q_L ** 2 / A_L + g * A_L ** 2 / (2.0 * B_L)
+        F_mom_L  = Q_L ** 2 / A_L + g * A_L ** 2 / (2.0 * B)
         F_mass_R = Q_R
-        F_mom_R  = Q_R ** 2 / A_R + g * A_R ** 2 / (2.0 * B_R)
+        F_mom_R  = Q_R ** 2 / A_R + g * A_R ** 2 / (2.0 * B)
 
         den = np.maximum(S_R - S_L, 1e-6)
         Flux_mass = (S_R * F_mass_L - S_L * F_mass_R
@@ -1955,23 +1960,20 @@ def solve_dynamic_wave_hll(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         A_new = A.copy()
         A_new[1:-1] = A[1:-1] - (dt / dx) * (Flux_mass[1:] - Flux_mass[:-1])
 
-        S0_inner = S0[1:-1] if isinstance(S0, np.ndarray) else S0
-        S_grav = g * A[1:-1] * S0_inner
+        S_grav = g * A[1:-1] * S0
         Q_star = Q[1:-1] - (dt / dx) * (Flux_mom[1:] - Flux_mom[:-1]) + dt * S_grav
 
-        B_inner = B[1:-1] if isinstance(B, np.ndarray) else B
-        n_inner = n_manning[1:-1] if isinstance(n_manning, np.ndarray) else n_manning
-        R  = np.maximum(A[1:-1] / (B_inner + 2.0 * A[1:-1] / B_inner), 0.01)
-        Kf = (g * n_inner ** 2 * np.abs(Q[1:-1])) / (A[1:-1] * R ** (4.0 / 3.0))
+        R  = np.maximum(A[1:-1] / (B + 2.0 * A[1:-1] / B), 0.01)
+        Kf = (g * n_manning ** 2 * np.abs(Q[1:-1])) / (A[1:-1] * R ** (4.0 / 3.0))
 
         Q_new = Q.copy()
         Q_new[1:-1] = Q_star / (1.0 + dt * Kf)
 
         Q_new[0]  = np.interp(t + dt, t_data, Q_data)
         A_new[0]  = A_new[1]      # temporary — overwritten by Riemann fix below
-        y_down    = _downstream_depth(bc_type, Q[-2], B_ds, n_ds, slope_bc,
+        y_down    = _downstream_depth(bc_type, Q[-2], B, n_manning, slope_bc,
                                       t + dt, t_data, stage_data, z_bed_ds)
-        A_new[-1] = B_ds * y_down
+        A_new[-1] = B * y_down
         Q_new[-1] = Q_new[-2]
 
         A = np.maximum(A_new, 0.1)
@@ -1983,41 +1985,34 @@ def solve_dynamic_wave_hll(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         # when Q changes rapidly.  Replace with the C⁻ Riemann invariant
         # R⁻ = V₁ − 2c₁ and solve for y₀ via Newton-Raphson.
         if MC_UPSTREAM_FIX:
-            B0 = B[0] if isinstance(B, np.ndarray) else B
-            B1 = B[1] if isinstance(B, np.ndarray) else B
-            n0 = n_manning[0] if isinstance(n_manning, np.ndarray) else n_manning
-            S0_0 = S0[0] if isinstance(S0, np.ndarray) else S0
-            _y1 = A[1] / B1
+            _y1 = A[1] / B
             _V1 = Q[1] / A[1]
             _c1 = np.sqrt(g * _y1)
             _Rminus = _V1 - 2.0 * _c1
             _y0 = _y1
             _Q0 = Q[0]
             for _it in range(25):
-                _V0 = _Q0 / (B0 * _y0)
+                _V0 = _Q0 / (B * _y0)
                 _c0 = np.sqrt(g * _y0)
                 _f  = _V0 - 2.0 * _c0 - _Rminus
-                _df = -_Q0 / (B0 * _y0 ** 2) - np.sqrt(g / _y0)
+                _df = -_Q0 / (B * _y0 ** 2) - np.sqrt(g / _y0)
                 if abs(_df) < 1e-14:
                     break
                 _y0_new = _y0 - _f / _df
                 if abs(_y0_new - _y0) < 1e-8:
                     break
                 _y0 = max(_y0_new, 0.01)
-            _yn0 = get_normal_depth(abs(_Q0), B0, n0, S0_0)
+            _yn0 = get_normal_depth(abs(_Q0), B, n_manning, S0)
             _y0  = np.clip(_y0, 0.5 * _yn0, 1.5 * _yn0)
-            A[0] = B0 * _y0
+            A[0] = B * _y0
 
         # ── Optional sponge layer ──
         if MC_UPSTREAM_FIX and MC_SPONGE_STRENGTH > 0:
             _n_sp = min(MC_SPONGE_CELLS, nx - 1)
             for _i in range(_n_sp):
                 _w = MC_SPONGE_STRENGTH * np.exp(-3.0 * _i / _n_sp)
-                Bi = B[_i] if isinstance(B, np.ndarray) else B
-                ni = n_manning[_i] if isinstance(n_manning, np.ndarray) else n_manning
-                S0i = S0[_i] if isinstance(S0, np.ndarray) else S0
-                _yn_i = get_normal_depth(abs(Q[_i]), Bi, ni, S0i)
-                A[_i] = (1.0 - _w) * A[_i] + _w * (Bi * _yn_i)
+                _yn_i = get_normal_depth(abs(Q[_i]), B, n_manning, S0)
+                A[_i] = (1.0 - _w) * A[_i] + _w * (B * _yn_i)
 
         # Coupled sediment transport step
         if sed is not None:
@@ -2041,7 +2036,7 @@ def solve_dynamic_wave_hll(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 #  3-D.  Kinematic Wave
 # ────────────────────────────────────────────────────────────────
 
-def solve_kinematic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
+def solve_kinematic_wave(L, B, S0, n_manning, dx, t_end, csv_file,
                          store_interval=30.0):
     """
     Kinematic-wave approximation of the Saint-Venant equations.
@@ -2112,21 +2107,12 @@ def solve_kinematic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
     • Headwater catchments far from any downstream control
     • As a fast baseline to assess whether inertia terms matter
     """
-    z_bed_ds = z_bed[-1]
-    B_ds = B[-1] if isinstance(B, np.ndarray) else B
-    n_ds = n_manning[-1] if isinstance(n_manning, np.ndarray) else n_manning
-    S0_ds = S0[-1] if isinstance(S0, np.ndarray) else S0
-    t_data, Q_data, _ = _load_bc_data(csv_file, 'NORMAL_DEPTH', z_bed_ds, B_ds, n_ds, S0_ds)
+    nx, x, z_bed = _setup_grid(L, dx, S0)
+    t_data, Q_data, _ = _load_bc_data(csv_file, 'NORMAL_DEPTH')
 
     Q0      = np.interp(0.0, t_data, Q_data)
-    B0 = B[0] if isinstance(B, np.ndarray) else B
-    n0 = n_manning[0] if isinstance(n_manning, np.ndarray) else n_manning
-    S0_0 = S0[0] if isinstance(S0, np.ndarray) else S0
-    y_start = get_normal_depth(Q0, B0, n0, S0_0)
-    A = np.array([B[i] * get_normal_depth(Q0, B[i] if isinstance(B, np.ndarray) else B,
-                                           n_manning[i] if isinstance(n_manning, np.ndarray) else n_manning,
-                                           S0[i] if isinstance(S0, np.ndarray) else S0)
-                  for i in range(nx)])
+    y_start = get_normal_depth(Q0, B, n_manning, S0)
+    A = np.full(nx, B * y_start)
     Q = np.full(nx, Q0)
 
     # Sediment transport state
@@ -2149,16 +2135,13 @@ def solve_kinematic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
             dt = t_end - t
 
         Q_in = np.interp(t + dt, t_data, Q_data)
-        B0 = B[0] if isinstance(B, np.ndarray) else B
-        n0 = n_manning[0] if isinstance(n_manning, np.ndarray) else n_manning
-        S0_0 = S0[0] if isinstance(S0, np.ndarray) else S0
-        y_in = get_normal_depth(Q_in, B0, n0, S0_0)
+        y_in = get_normal_depth(Q_in, B, n_manning, S0)
 
         # Continuity: backward (upwind) finite difference for positive flow
         #   ∂A/∂t + ∂Q/∂x = 0  →  A[i]ⁿ⁺¹ = A[i]ⁿ − Δt/Δx (Q[i]ⁿ − Q[i-1]ⁿ)
         dQ_dx  = np.diff(Q) / dx        # dQ_dx[i] = (Q[i+1]−Q[i])/Δx → A[1:] backward
         A[1:] -= dt * dQ_dx
-        A[0]   = B0 * y_in
+        A[0]   = B * y_in
 
         # Q is a diagnostic (Manning's) — always recompute from the updated
         # A so that stored Q and A are at the same time level.
@@ -2188,7 +2171,7 @@ def solve_kinematic_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
 #  3-E.  Diffusive Wave  (Zero-Inertia)
 # ────────────────────────────────────────────────────────────────
 
-def solve_diffusive_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
+def solve_diffusive_wave(L, B, S0, n_manning, dx, t_end, csv_file,
                          bc_type, store_interval=30.0):
     """
     Diffusive-wave (zero-inertia) approximation — Muskingum-Cunge scheme.
@@ -2247,19 +2230,15 @@ def solve_diffusive_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
     satisfy the finite-difference continuity equation.
     """
     bc_type = bc_type.upper()
+    nx, x, z_bed = _setup_grid(L, dx, S0)
     z_bed_ds = z_bed[-1]
-    B_ds = B[-1] if isinstance(B, np.ndarray) else B
-    n_ds = n_manning[-1] if isinstance(n_manning, np.ndarray) else n_manning
-    S0_ds = S0[-1] if isinstance(S0, np.ndarray) else S0
-    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type, z_bed_ds, B_ds, n_ds, S0_ds)
+    t_data, Q_data, stage_data = _load_bc_data(csv_file, bc_type)
 
     Q0      = np.interp(0.0, t_data, Q_data)
     Q       = np.full(nx, Q0)
     # Initial depth via Manning's rating curve (uniform normal depth)
-    A = np.array([B[i] * get_normal_depth(Q0, B[i] if isinstance(B, np.ndarray) else B,
-                                           n_manning[i] if isinstance(n_manning, np.ndarray) else n_manning,
-                                           S0[i] if isinstance(S0, np.ndarray) else S0)
-                  for i in range(nx)])
+    y_init  = get_normal_depth(Q0, B, n_manning, S0)
+    A       = np.full(nx, B * y_init)
 
     # Sediment transport state
     sed = _init_sediment_state(nx, z_bed, B, SED_GRAIN_SIZES, SED_BED_FRACTIONS) if SEDIMENT_TRANSPORT else None
@@ -2273,11 +2252,7 @@ def solve_diffusive_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         # ── Hydraulic parameters from current Q via Manning ──────────────
         Q_pos = np.maximum(Q, 0.001)          # guard division; Q ≥ 0 here
         # Normal depth from Manning's equation (cell-centred)
-        y = np.array([get_normal_depth(Q_pos[i],
-                                        B[i] if isinstance(B, np.ndarray) else B,
-                                        n_manning[i] if isinstance(n_manning, np.ndarray) else n_manning,
-                                        S0[i] if isinstance(S0, np.ndarray) else S0)
-                      for i in range(nx)])
+        y     = np.array([get_normal_depth(qi, B, n_manning, S0) for qi in Q_pos])
         V     = Q_pos / (B * y)               # cross-section-averaged velocity
         ck    = (5.0 / 3.0) * V               # Seddon celerity
         D     = Q_pos / (2.0 * B * S0)        # Hayami diffusivity
@@ -2318,11 +2293,7 @@ def solve_diffusive_wave(nx, x, z_bed, B, n_manning, dx, S0, t_end, csv_file,
         # Computing A from the rating curve is therefore internally
         # consistent with the physics and avoids the spurious depth
         # oscillations produced by a separate continuity update.
-        A = np.array([(B[i] if isinstance(B, np.ndarray) else B) * get_normal_depth(Q[i],
-                                               B[i] if isinstance(B, np.ndarray) else B,
-                                               n_manning[i] if isinstance(n_manning, np.ndarray) else n_manning,
-                                               S0[i] if isinstance(S0, np.ndarray) else S0)
-                      for i in range(nx)])
+        A = B * np.array([get_normal_depth(qi, B, n_manning, S0) for qi in Q])
 
         # ── Coupled sediment transport step ─────────────────────────────
         if sed is not None:
@@ -2472,7 +2443,7 @@ def _collect_mid_observation_data(solvers, length, width, t_final, num_intervals
     """
     Sample stage and velocity at the middle of the profile at regular
     time intervals for each solver.
-
+    
     Returns a dictionary with solver names as keys, each containing:
         - 'time': array of sample times
         - 'stage': array of stage values at mid-point
@@ -2480,35 +2451,35 @@ def _collect_mid_observation_data(solvers, length, width, t_final, num_intervals
     """
     obs_x = length / 2.0
     results = {}
-
+    
     for name, data in solvers.items():
         if not data:
             continue
-
+        
         # Find the observation point index
         x_grid = data[0][0]
         obs_idx = np.argmin(np.abs(x_grid - obs_x))
-
+        
         # Get all time steps from the data
         all_times = np.array([step[4] for step in data])
-
+        
         # Create interpolation points
         target_times = np.linspace(0, t_final, num_intervals)
-
+        
         # Collect stage and velocity at each time
         stage_series = np.array([step[1][obs_idx] + step[2][obs_idx] for step in data])
         vel_series = np.array([step[3][obs_idx] / (step[2][obs_idx] * width) for step in data])
-
+        
         # Interpolate to regular intervals
         stage_interp = np.interp(target_times, all_times, stage_series)
         vel_interp = np.interp(target_times, all_times, vel_series)
-
+        
         results[name] = {
             'time': target_times,
             'stage': stage_interp,
             'velocity': vel_interp
         }
-
+    
     return results
 
 
@@ -2522,68 +2493,68 @@ def _plot_mid_observation(obs_data, length):
     if 'Dynamic (MacCormack)' not in obs_data:
         print("Warning: Dynamic (MacCormack) data not available for mid-observation plot.")
         return
-
+    
     maccormack_data = obs_data['Dynamic (MacCormack)']
     mac_stage = maccormack_data['stage']
     mac_vel = maccormack_data['velocity']
     time_array = maccormack_data['time']
-
+    
     # Create figure with 3 subplots
     fig = plt.figure(figsize=(14, 10))
     gs = fig.add_gridspec(2, 2, height_ratios=[1, 1], hspace=0.3, wspace=0.3)
     ax_stage = fig.add_subplot(gs[0, 0])
     ax_vel = fig.add_subplot(gs[0, 1])
     ax_ts = fig.add_subplot(gs[1, :])
-
+    
     # Top-left: MacCormack stage vs other solver stages
-    ax_stage.plot([mac_stage.min(), mac_stage.max()],
-                  [mac_stage.min(), mac_stage.max()],
+    ax_stage.plot([mac_stage.min(), mac_stage.max()], 
+                  [mac_stage.min(), mac_stage.max()], 
                   'k--', lw=1, alpha=0.5, label='1:1 Line')
-
+    
     for name, data in obs_data.items():
         if name == 'Dynamic (MacCormack)':
             continue
         vis = SOLVER_VIS.get(name, {'color': 'gray', 'ls': '-', 'lw': 1.5})
-        ax_stage.scatter(mac_stage, data['stage'],
+        ax_stage.scatter(mac_stage, data['stage'], 
                         c=vis['color'], alpha=0.6, s=20, label=name)
-
+    
     ax_stage.set_xlabel('Dynamic (MacCormack) Stage (m)')
     ax_stage.set_ylabel('Other Solver Stage (m)')
     ax_stage.set_title('Stage Comparison at Mid-Channel')
     ax_stage.legend(fontsize=8)
     ax_stage.grid(True, alpha=0.3)
-
+    
     # Top-right: MacCormack velocity vs other solver velocities
-    ax_vel.plot([mac_vel.min(), mac_vel.max()],
-                [mac_vel.min(), mac_vel.max()],
+    ax_vel.plot([mac_vel.min(), mac_vel.max()], 
+                [mac_vel.min(), mac_vel.max()], 
                 'k--', lw=1, alpha=0.5, label='1:1 Line')
-
+    
     for name, data in obs_data.items():
         if name == 'Dynamic (MacCormack)':
             continue
         vis = SOLVER_VIS.get(name, {'color': 'gray', 'ls': '-', 'lw': 1.5})
-        ax_vel.scatter(mac_vel, data['velocity'],
+        ax_vel.scatter(mac_vel, data['velocity'], 
                       c=vis['color'], alpha=0.6, s=20, label=name)
-
+    
     ax_vel.set_xlabel('Dynamic (MacCormack) Velocity (m/s)')
     ax_vel.set_ylabel('Other Solver Velocity (m/s)')
     ax_vel.set_title('Velocity Comparison at Mid-Channel')
     ax_vel.legend(fontsize=8)
     ax_vel.grid(True, alpha=0.3)
-
+    
     # Bottom: Time series of stage for all solvers
     for name, data in obs_data.items():
         vis = SOLVER_VIS.get(name, {'color': 'gray', 'ls': '-', 'lw': 1.5})
-        ax_ts.plot(data['time'], data['stage'],
-                   label=name, color=vis['color'],
+        ax_ts.plot(data['time'], data['stage'], 
+                   label=name, color=vis['color'], 
                    ls=vis['ls'], lw=vis['lw'])
-
+    
     ax_ts.set_xlabel('Time (s)')
     ax_ts.set_ylabel('Stage (m)')
     ax_ts.set_title(f'Stage Time Series at Mid-Channel (x = {length/2:.0f} m)')
     ax_ts.legend(fontsize=8, ncol=2)
     ax_ts.grid(True, alpha=0.3)
-
+    
     plt.suptitle('Mid-Channel Observation Analysis', fontsize=14, y=0.995)
     _safe_show()
 
@@ -2778,7 +2749,7 @@ def _plot_sediment_single(data, length, width, solver_name):
 def _plot_sediment_output(solvers, length, width, t_final):
     """
     Create the comprehensive SEDIMENT output option plot.
-
+    
     Layout (5 subplots):
     1. Top (full width): Final bed elevation change profile for all solvers
     2. Second row (full width): Cumulative sediment bed change volume along transect
@@ -2789,9 +2760,9 @@ def _plot_sediment_output(solvers, length, width, t_final):
     if not SEDIMENT_TRANSPORT:
         print("Warning: SEDIMENT output type requires SEDIMENT_TRANSPORT = True")
         return
-
+    
     obs_x = length / 2.0
-
+    
     # Create figure with custom grid: 4 rows, 2 columns
     fig = plt.figure(figsize=(16, 17))
     gs = fig.add_gridspec(4, 2, height_ratios=[1, 1, 1.2, 1.2], hspace=0.40, wspace=0.3)
@@ -2800,7 +2771,7 @@ def _plot_sediment_output(solvers, length, width, t_final):
     ax_rate = fig.add_subplot(gs[2, 0])      # Row 2 left: rating curve
     ax_ts   = fig.add_subplot(gs[2, 1])      # Row 2 right: sediment flux time series
     ax_box  = fig.add_subplot(gs[3, :])      # Row 3: box plots by channel segment
-
+    
     # ─── Subplot 1: Final bed elevation change profile (top, full width) ───
     # First pass: find global y-axis max across all solvers to avoid skewing
     all_delta_eta = []
@@ -2812,7 +2783,7 @@ def _plot_sediment_output(solvers, length, width, t_final):
         if sed_state is None:
             continue
         all_delta_eta.extend(sed_state['delta_eta'])
-
+    
     if all_delta_eta:
         arr = np.array(all_delta_eta)
         vmin, vmax = np.percentile(arr, 2), np.percentile(arr, 98)
@@ -2821,7 +2792,7 @@ def _plot_sediment_output(solvers, length, width, t_final):
         y_lim_low, y_lim_high = vmin - pad, vmax + pad
     else:
         y_lim_low, y_lim_high = -1.0, 1.0
-
+    
     for name, data in solvers.items():
         if not data:
             continue
@@ -2834,7 +2805,7 @@ def _plot_sediment_output(solvers, length, width, t_final):
         delta_eta = sed_state['delta_eta']
         ax_bed.plot(x_grid, delta_eta, label=name,
                    color=vis['color'], ls=vis['ls'], lw=vis['lw'])
-
+    
     ax_bed.axhline(0, color='gray', ls='--', lw=0.8, alpha=0.5)
     ax_bed.axvline(obs_x, color='gray', ls=':', lw=1, alpha=0.5)
     ax_bed.set_ylim(y_lim_low, y_lim_high)
@@ -2843,7 +2814,7 @@ def _plot_sediment_output(solvers, length, width, t_final):
     ax_bed.set_title('Final Bed Elevation Change Profile', fontsize=12, fontweight='bold')
     ax_bed.legend(fontsize=9, ncol=3, loc='best')
     ax_bed.grid(True, alpha=0.3)
-
+    
     # ─── Subplot 2: Cumulative sediment bed change volume along transect ───
     for name, data in solvers.items():
         if not data:
@@ -2856,15 +2827,15 @@ def _plot_sediment_output(solvers, length, width, t_final):
         x_grid = last[0]
         delta_eta = sed_state['delta_eta']
         dx = x_grid[1] - x_grid[0]
-
+        
         # Cumulative volume from upstream to downstream
         # Volume at each node = delta_eta * width * dx
         volume_increments = delta_eta * width * dx
         cumulative_volume = np.cumsum(volume_increments)
-
+        
         ax_vol.plot(x_grid, cumulative_volume, label=name,
                color=vis['color'], ls=vis['ls'], lw=vis['lw'])
-
+    
     ax_vol.axhline(0, color='gray', ls='--', lw=0.8, alpha=0.5)
     ax_vol.axvline(obs_x, color='gray', ls=':', lw=1, alpha=0.5)
     # Determine y-limits for cumulative volume using percentiles to avoid extreme outliers
@@ -2882,69 +2853,69 @@ def _plot_sediment_output(solvers, length, width, t_final):
     ax_vol.set_title('Cumulative Sediment Volume Along Channel', fontsize=12, fontweight='bold')
     ax_vol.legend(fontsize=9, ncol=3, loc='best')
     ax_vol.grid(True, alpha=0.3)
-
+    
     # ─── Subplot 3: Rating curve at mid-observation (bottom left) ───
     # Collect data for rating curve and shear stress
     all_tau = []
     rating_data = {}
-
+    
     for name, data in solvers.items():
         if not data:
             continue
         if len(data[0]) <= 5 or data[0][5] is None:
             continue
-
+        
         vis = SOLVER_VIS.get(name, {'color': 'gray', 'ls': '-', 'lw': 1.5})
         x_grid = data[0][0]
         obs_idx = np.argmin(np.abs(x_grid - obs_x))
-
+        
         Q_vals = []
         C_vals = []
         tau_vals = []
-
+        
         rho_s = SED_SPECIFIC_GRAVITY * 1000.0
-
+        
         for step in data:
             sed_st = step[5] if len(step) > 5 else None
             if sed_st is None:
                 break
-
+            
             y_i = step[2][obs_idx]
             Q_i = step[3][obs_idx]
             Qb_i = sed_st['Qb'][obs_idx]
-
+            
             # Depth-averaged sediment concentration: C = ρ_s * Q_b / Q
             if abs(Q_i) > 1e-6:
                 C_i = rho_s * Qb_i / abs(Q_i)
             else:
                 C_i = 0.0
-
+            
             # Bed shear stress
             tau_star, tau_bed, _ = _sed_shields_parameter(
                 np.array([y_i]), np.array([Q_i]), width, MANNING_N, SED_D50
             )
-
+            
             Q_vals.append(abs(Q_i))
             C_vals.append(C_i)
             tau_vals.append(tau_bed[0])
-
+        
         if Q_vals:
             ax_rate.scatter(Q_vals, C_vals, c=vis['color'], s=20, alpha=0.6, label=name)
             all_tau.extend(tau_vals)
             rating_data[name] = {'Q': Q_vals, 'C': C_vals, 'tau': tau_vals}
-
+    
     ax_rate.set_xlabel('Total Discharge Q (m³/s)', fontsize=11)
     ax_rate.set_ylabel('Sediment Concentration C (kg/m³)', fontsize=11)
     ax_rate.set_title('Rating Curve at Mid-Channel', fontsize=12, fontweight='bold')
     ax_rate.legend(fontsize=8, loc='upper left')
     ax_rate.grid(True, alpha=0.3)
-
+    
     # Second x-axis for shear stress (positioned below)
     ax_tau = ax_rate.twiny()
     ax_tau.set_xlabel('Boundary Shear Stress τ (Pa)', fontsize=10, color='#D55E00')
-    ax_tau.tick_params(axis='x', labelcolor='#D55E00', top=False, labeltop=False,
+    ax_tau.tick_params(axis='x', labelcolor='#D55E00', top=False, labeltop=False, 
                       bottom=True, labelbottom=True)
-
+    
     if all_tau:
         tau_min, tau_max = min(all_tau), max(all_tau)
         tau_pad = (tau_max - tau_min) * 0.1 if tau_max > tau_min else 0.1
@@ -2962,32 +2933,32 @@ def _plot_sediment_output(solvers, length, width, t_final):
         cmin, cmax = np.percentile(carr, 2), np.percentile(carr, 98)
         padc = max((cmax - cmin) * 0.1, 1e-6)
         ax_rate.set_ylim(max(cmin - padc, 0.0), cmax + padc)
-
+    
     ax_tau.spines['bottom'].set_position(('outward', 40))
     ax_tau.xaxis.set_ticks_position('bottom')
     ax_tau.xaxis.set_label_position('bottom')
-
+    
     # ─── Subplot 4: Time series of sediment flux at mid-observation (bottom right) ───
     for name, data in solvers.items():
         if not data:
             continue
         if len(data[0]) <= 5 or data[0][5] is None:
             continue
-
+        
         vis = SOLVER_VIS.get(name, {'color': 'gray', 'ls': '-', 'lw': 1.5})
         x_grid = data[0][0]
         obs_idx = np.argmin(np.abs(x_grid - obs_x))
-
+        
         times = []
         Qb_mid = []
-
+        
         for step in data:
             sed_st = step[5] if len(step) > 5 else None
             if sed_st is None:
                 break
             times.append(step[4])
             Qb_mid.append(sed_st['Qb'][obs_idx])
-
+        
         if times:
             ax_ts.plot(times, Qb_mid, label=name,
                       color=vis['color'], ls=vis['ls'], lw=vis['lw'])
@@ -3001,13 +2972,13 @@ def _plot_sediment_output(solvers, length, width, t_final):
         fmin, fmax = np.percentile(arrf, 2), np.percentile(arrf, 98)
         padf = max((fmax - fmin) * 0.1, 1e-9)
         ax_ts.set_ylim(max(fmin - padf, 0.0), fmax + padf)
-
+    
     ax_ts.set_xlabel('Time (s)', fontsize=11)
     ax_ts.set_ylabel('Sediment Flux Qb (m³/s)', fontsize=11)
     ax_ts.set_title(f'Sediment Flux Time Series at x = {obs_x:.0f} m', fontsize=12, fontweight='bold')
     ax_ts.legend(fontsize=8, ncol=1, loc='best')
     ax_ts.grid(True, alpha=0.3)
-
+    
     # ─── Subplot 5: Box plots of bed change binned at 1/10 channel length ───
     n_bins = 10
     bin_edges   = np.linspace(0, length, n_bins + 1)
@@ -3247,28 +3218,28 @@ def build_animation(solvers, solver_vis, length, t_final, csv_path,
             print("  Windows: https://ffmpeg.org/download.html — add to PATH, then re-run the script.")
             plt.close(fig)
             return
-
+        
         # Create a custom progress callback for animation saving
         print("  Saving animation...")
         from matplotlib.animation import FFMpegWriter
         writer = FFMpegWriter(fps=fps, metadata={'artist': '1DFlowModel'})
-
+        
         total_frames = num_frames
         progress_bar_width = 50
-
+        
         with writer.saving(fig, base + '.mp4', dpi=120):
             for frame_num in range(total_frames):
                 update(frame_num)
                 writer.grab_frame()
-
+                
                 # Display progress meter
                 progress = (frame_num + 1) / total_frames
                 filled = int(progress_bar_width * progress)
                 bar = '█' * filled + '░' * (progress_bar_width - filled)
                 percent = progress * 100
-                print(f"\r  Writing animation: |{bar}| {percent:.1f}% ({frame_num+1}/{total_frames} frames)",
+                print(f"\r  Writing animation: |{bar}| {percent:.1f}% ({frame_num+1}/{total_frames} frames)", 
                       end='', flush=True)
-
+        
         print()  # New line after progress bar
         print(f"  Animation saved → {base}.mp4")
     except Exception as e:
@@ -3276,40 +3247,6 @@ def build_animation(solvers, solver_vis, length, t_final, csv_path,
         print("Ensure ffmpeg is installed and available on PATH. No GIF fallback is performed.")
     plt.close(fig)
 
-
-def write_run_info(solver_type, flow_csv, chan_csv, c_nx, c_B, c_S0, t_final, dt_store):
-    """Write metadata to a sequential run_info_##.txt file in the local directory."""
-    import re
-    # Find next run number
-    run_files = [f for f in os.listdir('.') if f.startswith('run_info_') and f.endswith('.txt')]
-    pattern = re.compile(r'run_info_(\d+)\.txt')
-    run_nums = []
-    for f in run_files:
-        m = pattern.match(f)
-        if m:
-            run_nums.append(int(m.group(1)))
-
-    next_num = max(run_nums) + 1 if run_nums else 0
-    filename = f"run_info_{next_num:02d}.txt"
-
-    with open(filename, 'w') as f:
-        f.write("1D Flow Model Simulation WSE Run Metadata\n")
-        f.write("=" * 45 + "\n")
-        f.write(f"Flow Boundary File Used:    {os.path.basename(flow_csv)}\n")
-        f.write(f"Channel Geometry File Used: {os.path.basename(chan_csv)}\n")
-        f.write(f"Solver Type:                {solver_type}\n")
-        f.write("-" * 45 + "\n")
-        f.write("Key Parameters:\n")
-        f.write(f"  Simulation Time:        {t_final} s\n")
-        f.write(f"  Grid Points:            {c_nx}\n")
-        f.write(f"  Average Width:          {np.mean(c_B):.2f} m\n")
-        f.write(f"  Average Bed Slope:      {np.mean(c_S0):.5f} m/m\n")
-        f.write(f"  Storage Interval:       {dt_store:.2f} s\n")
-        if SEDIMENT_TRANSPORT:
-            f.write("  Sediment Transport:     Enabled\n")
-            f.write(f"  Sediment Formula:       {SED_FORMULA}\n")
-
-    print(f"Run metadata written to {filename}")
 
 # ────────────────────────────────────────────────────────────────
 #  Solver comparison summary table
@@ -3347,33 +3284,20 @@ if SOLVER_TYPE == 'COMPARE':
     anim_interval = min(T_FINAL / 100.0, 10.0)
     print(f"Storage interval: {anim_interval:.2f} s\n")
 
-    # Load channel geometry
-    c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0 = _load_channel_data(CHAN_CSV_PATH)
-    C_LENGTH = c_x[-1]
-
-    print("\n--- Diagnostic Input Summary ---")
-    print(f"Flow File Used:    {FLOW_CSV_PATH}")
-    print(f"Channel File Used: {CHAN_CSV_PATH}")
-    print(f"Grid Points:       {c_nx}")
-    print(f"Average Width:     {np.mean(c_B):.2f} m")
-    print(f"Average Bed Slope: {np.mean(c_S0):.5f} m/m")
-    print(f"Total Sim. Time:   {T_FINAL} s")
-    print("--------------------------------\n")
-
     t0 = _timer.perf_counter()
-    res_dyn = solve_dynamic_wave(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0,
-                                 T_FINAL, FLOW_CSV_PATH, BC_MODE, NORMAL_SLOPE,
+    res_dyn = solve_dynamic_wave(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX,
+                                 T_FINAL, CSV_PATH, BC_MODE, NORMAL_SLOPE,
                                  store_interval=anim_interval)
-    res_lax = solve_dynamic_wave_lax(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0,
-                                     T_FINAL, FLOW_CSV_PATH, BC_MODE, NORMAL_SLOPE,
+    res_lax = solve_dynamic_wave_lax(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX,
+                                     T_FINAL, CSV_PATH, BC_MODE, NORMAL_SLOPE,
                                      store_interval=anim_interval)
-    res_hll = solve_dynamic_wave_hll(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0,
-                                     T_FINAL, FLOW_CSV_PATH, BC_MODE, NORMAL_SLOPE,
+    res_hll = solve_dynamic_wave_hll(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX,
+                                     T_FINAL, CSV_PATH, BC_MODE, NORMAL_SLOPE,
                                      store_interval=anim_interval)
-    res_kin = solve_kinematic_wave(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0,
-                                  T_FINAL, FLOW_CSV_PATH, store_interval=anim_interval)
-    res_dif = solve_diffusive_wave(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0,
-                                  T_FINAL, FLOW_CSV_PATH, BC_MODE,
+    res_kin = solve_kinematic_wave(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX,
+                                  T_FINAL, CSV_PATH, store_interval=anim_interval)
+    res_dif = solve_diffusive_wave(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX,
+                                  T_FINAL, CSV_PATH, BC_MODE,
                                   store_interval=anim_interval)
     elapsed = _timer.perf_counter() - t0
     print(f"\nAll solvers finished in {elapsed:.1f} s.\n")
@@ -3389,17 +3313,14 @@ if SOLVER_TYPE == 'COMPARE':
     # ── Summary table ──
     print_solver_summary(solvers, WIDTH, anim_interval)
 
-    # ── Write Run Metadata ──
-    write_run_info('COMPARE (All Solvers)', FLOW_CSV_PATH, CHAN_CSV_PATH, c_nx, c_B, c_S0, T_FINAL, anim_interval)
-
     # ── Generate plots based on OUTPUT_TYPE ──
     if OUTPUT_TYPE == 'MID_OBSERVATION':
         print("\nGenerating mid-observation plots...")
-        obs_data = _collect_mid_observation_data(solvers, C_LENGTH, np.mean(c_B), T_FINAL, num_intervals=1000)
-        _plot_mid_observation(obs_data, C_LENGTH)
+        obs_data = _collect_mid_observation_data(solvers, LENGTH, WIDTH, T_FINAL, num_intervals=1000)
+        _plot_mid_observation(obs_data, LENGTH)
     elif OUTPUT_TYPE == 'SEDIMENT':
         print("\nGenerating sediment output plots...")
-        _plot_sediment_output(solvers, C_LENGTH, np.mean(c_B), T_FINAL)
+        _plot_sediment_output(solvers, LENGTH, WIDTH, T_FINAL)
     else:
         # ── Static comparison plots (PROFILE_PLOTS mode) ──
         fig, axes = plt.subplots(3, 1, figsize=(12, 13), sharex=True)
@@ -3420,9 +3341,9 @@ if SOLVER_TYPE == 'COMPARE':
                     valid = False
                     break
                 max_wse = np.maximum(max_wse, step[1] + y_i)
-                v_i     = np.abs(Q_i / (y_i * c_B))
+                v_i     = np.abs(Q_i / (y_i * WIDTH))
                 max_vel = np.maximum(max_vel, v_i)
-                max_fr  = np.maximum(max_fr, _froude_number(y_i, Q_i, c_B))
+                max_fr  = np.maximum(max_fr, _froude_number(y_i, Q_i, WIDTH))
             if not valid:
                 continue
             ax_wse.plot(x_grid, max_wse, label=name, color=vis['color'],
@@ -3437,7 +3358,7 @@ if SOLVER_TYPE == 'COMPARE':
             # EGL at peak for reference (MacCormack)
             idx_pk = int(np.argmax([s[3][0] for s in res_dyn]))
             egl = _energy_grade_line(res_dyn[idx_pk][1], res_dyn[idx_pk][2],
-                                     res_dyn[idx_pk][3], c_B)
+                                     res_dyn[idx_pk][3], WIDTH)
             ax_wse.plot(res_dyn[idx_pk][0], egl, 'k--', lw=1, alpha=0.5,
                         label='EGL (MacCormack @ peak Q)')
 
@@ -3455,44 +3376,31 @@ if SOLVER_TYPE == 'COMPARE':
     # ── Sediment transport plots (if enabled) ──
     if SEDIMENT_TRANSPORT:
         print("\nGenerating sediment transport plots...")
-        _plot_sediment_comparison(solvers, C_LENGTH, np.mean(c_B))
+        _plot_sediment_comparison(solvers, LENGTH, WIDTH)
 
     # ── Animation ──
     if SAVE_ANIMATION:
         print("Building animation (set SAVE_ANIMATION = False to skip) …")
-        build_animation(solvers, SOLVER_VIS, C_LENGTH, T_FINAL, FLOW_CSV_PATH,
+        build_animation(solvers, SOLVER_VIS, LENGTH, T_FINAL, CSV_PATH,
                         SCRIPT_DIR, fps=ANIMATION_FPS)
     else:
         print("Animation skipped (SAVE_ANIMATION = False).")
 
 else:
     # ── Single-solver execution ──
-    # Load channel geometry
-    c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0 = _load_channel_data(CHAN_CSV_PATH)
-    C_LENGTH = c_x[-1]
-
-    print("\n--- Diagnostic Input Summary ---")
-    print(f"Flow File Used:    {FLOW_CSV_PATH}")
-    print(f"Channel File Used: {CHAN_CSV_PATH}")
-    print(f"Grid Points:       {c_nx}")
-    print(f"Average Width:     {np.mean(c_B):.2f} m")
-    print(f"Average Bed Slope: {np.mean(c_S0):.5f} m/m")
-    print(f"Total Sim. Time:   {T_FINAL} s")
-    print("--------------------------------\n")
-
     if SOLVER_TYPE == 'KINEMATIC':
-        data = solve_kinematic_wave(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0, T_FINAL, FLOW_CSV_PATH)
+        data = solve_kinematic_wave(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX, T_FINAL, CSV_PATH)
     elif SOLVER_TYPE == 'DIFFUSIVE':
-        data = solve_diffusive_wave(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0, T_FINAL, FLOW_CSV_PATH, BC_MODE)
+        data = solve_diffusive_wave(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX, T_FINAL, CSV_PATH, BC_MODE)
     elif SOLVER_TYPE == 'DYNAMIC_LAX':
-        data = solve_dynamic_wave_lax(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0, T_FINAL,
-                                      FLOW_CSV_PATH, BC_MODE, NORMAL_SLOPE)
+        data = solve_dynamic_wave_lax(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX, T_FINAL,
+                                      CSV_PATH, BC_MODE, NORMAL_SLOPE)
     elif SOLVER_TYPE == 'DYNAMIC_HLL':
-        data = solve_dynamic_wave_hll(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0, T_FINAL,
-                                      FLOW_CSV_PATH, BC_MODE, NORMAL_SLOPE)
+        data = solve_dynamic_wave_hll(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX, T_FINAL,
+                                      CSV_PATH, BC_MODE, NORMAL_SLOPE)
     else:
-        data = solve_dynamic_wave(c_nx, c_x, c_z_bed, c_B, c_n_manning, c_dx, c_S0, T_FINAL,
-                                  FLOW_CSV_PATH, BC_MODE, NORMAL_SLOPE)
+        data = solve_dynamic_wave(LENGTH, WIDTH, BED_SLOPE, MANNING_N, DX, T_FINAL,
+                                  CSV_PATH, BC_MODE, NORMAL_SLOPE)
 
     if data:
         t_series   = np.array([s[4] for s in data])
@@ -3500,11 +3408,11 @@ else:
         stage_out  = np.array([s[1][-1] + s[2][-1] for s in data])
 
         x_grid  = data[0][0]
-        obs_x   = C_LENGTH / 2.0
+        obs_x   = LENGTH / 2.0
         obs_idx = np.argmin(np.abs(x_grid - obs_x))
 
         obs_stage = np.array([s[1][obs_idx] + s[2][obs_idx] for s in data])
-        obs_vel   = np.array([s[3][obs_idx] / (s[2][obs_idx] * (c_B[obs_idx] if isinstance(c_B, np.ndarray) else c_B)) for s in data])
+        obs_vel   = np.array([s[3][obs_idx] / (s[2][obs_idx] * WIDTH) for s in data])
 
         idx_init = 0
         idx_peak = int(np.argmax(qin_series))
@@ -3535,7 +3443,7 @@ else:
             ax_wl.plot(data[idx][0], wse, color=prof_colors[i], lw=1.8, label=prof_labels[i])
         # EGL at peak
         egl = _energy_grade_line(data[idx_peak][1], data[idx_peak][2],
-                                 data[idx_peak][3], c_B)
+                                 data[idx_peak][3], WIDTH)
         ax_wl.plot(data[idx_peak][0], egl, 'k--', lw=1, alpha=0.4, label='EGL @ peak')
         ax_wl.axvline(x=obs_x, color='gray', ls=':', label='Obs. Point')
         ax_wl.set_xlabel('Distance (m)'); ax_wl.set_ylabel('Elevation (m)')
@@ -3546,7 +3454,7 @@ else:
         # Plot 3 — Velocity profiles
         fig3, ax_v = plt.subplots(figsize=(10, 5))
         for i, idx in enumerate(prof_idx):
-            V_i = data[idx][3] / (data[idx][2] * c_B)
+            V_i = data[idx][3] / (data[idx][2] * WIDTH)
             ax_v.plot(data[idx][0], V_i, color=prof_colors[i], lw=1.8, label=prof_labels[i])
         ax_v.axvline(x=obs_x, color='gray', ls=':', label='Obs. Point')
         ax_v.set_xlabel('Distance (m)'); ax_v.set_ylabel('Velocity (m/s)')
@@ -3566,7 +3474,7 @@ else:
 
         # Plot 5 — Froude number profile at peak
         fig5, ax_fr = plt.subplots(figsize=(10, 4))
-        fr_peak = _froude_number(data[idx_peak][2], data[idx_peak][3], c_B)
+        fr_peak = _froude_number(data[idx_peak][2], data[idx_peak][3], WIDTH)
         ax_fr.plot(data[idx_peak][0], fr_peak, '#D55E00', lw=1.8)
         ax_fr.axhline(1.0, color='gray', ls='--', lw=0.8, label='Fr = 1')
         ax_fr.fill_between(data[idx_peak][0], fr_peak, alpha=0.15, color='#D55E00')
@@ -3577,9 +3485,7 @@ else:
 
         # Mass balance check
         store_dt = t_series[1] - t_series[0] if len(t_series) > 1 else 1.0
-        # For simplicity in mass balance, use mean width if varying
-        mb_width = np.mean(c_B) if isinstance(c_B, np.ndarray) else c_B
-        vi, vo, ds, err = _mass_balance(data, mb_width, store_dt)
+        vi, vo, ds, err = _mass_balance(data, WIDTH, store_dt)
         print(f"\n  Mass balance: In={vi:.0f} m³  Out={vo:.0f} m³  ΔS={ds:.0f} m³  Error={err:.2f}%\n")
 
         # Sediment transport plots (if enabled)
@@ -3587,10 +3493,7 @@ else:
             solver_name_sed = SOLVER_TYPE.replace('_', ' ').title()
             if solver_name_sed == 'Dynamic':
                 solver_name_sed = 'Dynamic (MacCormack)'
-            _plot_sediment_single(data, C_LENGTH, np.mean(c_B), solver_name_sed)
-
-        # ── Write Run Metadata ──
-        write_run_info(SOLVER_TYPE, FLOW_CSV_PATH, CHAN_CSV_PATH, c_nx, c_B, c_S0, T_FINAL, store_dt)
+            _plot_sediment_single(data, LENGTH, WIDTH, solver_name_sed)
 
         # Animation (single solver)
         if SAVE_ANIMATION:
@@ -3601,5 +3504,5 @@ else:
             vis_dict = {solver_name: SOLVER_VIS.get(solver_name,
                         {'color': '#0072B2', 'ls': '-', 'lw': 2, 'marker': None})}
             print("Building animation …")
-            build_animation(single_dict, vis_dict, C_LENGTH, T_FINAL, FLOW_CSV_PATH,
+            build_animation(single_dict, vis_dict, LENGTH, T_FINAL, CSV_PATH,
                             SCRIPT_DIR, fps=ANIMATION_FPS)
